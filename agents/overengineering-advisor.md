@@ -63,12 +63,6 @@ This list is not comprehensive, just a starting point.
 - Complex expressions directly inside for/foreach/while loop definition or if condition. Assign them to local variables first with a descriptive name.
 - Lack of code comments/explanation: if it's not immediately obvious what code is intended to do just by skimming it, or if there are obviously external constraints that the code is working around, they **must** be explained in comments.
 
-### Organization
-
-- Only classes may have `internal` accessibility.
-  Fields, properties, and methods with the `internal` accessibility are *always* a red flag.
-  Even if it is for testing.
-
 ### Testing red flags
 
 Did the user specifically ask for tests?
@@ -96,3 +90,23 @@ Properties of good tests:
 - Readable: clearly shows scenario and expectation.
 - Specific: failure explains what behavior broke.
 - Isolated: does not perform I/O (common instances are writing to disk and making network calls).
+
+## C# Specific
+
+This section only applies to C#.
+
+### Classes/design
+
+Only classes may have `internal` accessibility.
+Fields, properties, and methods with the `internal` accessibility are *always* a red flag.
+Even if it is for testing.
+
+If a class *could* be a record (+use primary constructor), then it **must**.
+For records and structs specifically, suggest that behavior be implemented via extension methods instead of on instance methods.
+Even if the code technically works with instance methods, extension methods keep the data model as clean as possible.
+
+### Nullable
+
+*Never* use the null-forgiving operator.
+It must always be obvious what null means when a type is nullable.
+Usually, an empty collection can work in places where a nullable collection is used.
