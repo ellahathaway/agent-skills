@@ -4,7 +4,7 @@ description: Only use when explicitly asked.
 ---
 
 Variables:
-- `MAX_ITERATIONS=5`
+- `MAX_ITERATIONS=3`
 - `MODEL=opus-5.5`
 
 We will now go through a process designed to simplify your implementation.
@@ -28,7 +28,7 @@ The code up for review is `$CODE_TO_REVIEW`
 ```
 
 Do not provide additional context unless the advisor explicitly requests it.
-Answer the advisor's questions directly and make adjustments in response to the advisor's feedback.
+Respond directly to the advisor, and work together to incorporate their feedback.
 
 ### Important
 
