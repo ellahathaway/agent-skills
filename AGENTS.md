@@ -27,6 +27,6 @@ Therefore, the skill body should not contain qualifiers about when to use the sk
 
 ## Content
 
-Skills must use [plain language](https://en.wikipedia.org/wiki/Plain_language) at all times.
+Use simplified technical english for agent instructions.
 Start skills small with the minimum amount of content.
 Only add content over time as necessary to improve agent performance on specific tasks.
