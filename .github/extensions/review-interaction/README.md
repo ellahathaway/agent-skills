@@ -1,27 +1,64 @@
-# Review interaction canvas
+# Review canvas
 
-`.github\extensions\review-interaction` is a proof-of-concept Copilot canvas.
-Reload extensions, then open the `review-interaction` canvas. Click **Start
-review** to launch a real `code-review` subagent directly through
-`session.rpc.tasks.startAgent`. The extension collects the task's result into
-the panel using `session.rpc.tasks.list`. A spinner shows the reviewer working;
-a checkmark shows a successful result. Start/stop entries are persisted with
-`session.log` at info level.
+`.github\extensions\review-interaction` runs a graph of review agents and
+collects their feedback on a canvas.
 
-Starting a review does not send the main agent a message. Once the review
-stops, the extension queues a normal main-agent message containing the result
-or failure. It does not use experimental notification injection. The runtime
-may also emit its own native task-completion notification.
+## Flow
 
-The reviewer reads the repository's root `README.md` without changing files.
-It uses your normal subagent settings and AI credits. Only one request runs at
-a time. Direct launch and result-collection failures are displayed in the
-canvas, without falling back to the main agent. Closing the canvas does not
-cancel a review. Log and completion-message delivery failures are shown
-separately from the review result. If task monitoring fails, the canvas
-reports that the reviewer may still be running rather than claiming it
-finished. State is shared across this session's panels and resets on extension
-reload.
+1. The implementer calls `review_start` with the user's request and the code
+   to review.
+2. Each reviewer on the canvas runs as a subagent. Reviewers with no
+   connection between them run at the same time. A connection from A to B
+   runs B after A succeeds.
+3. Reviewers record findings with `review_add_comment`. Each comment keeps a
+   snippet of the code as the reviewer saw it.
+4. When the pass ends, the extension messages the implementer. The
+   implementer reads `review_list_comments`, fixes the code or answers with
+   `review_reply`, then calls `review_start` again.
+5. On the next pass, each reviewer gets its own open comments and their
+   replies. Only the reviewer that wrote a comment can resolve it, with
+   `review_resolve_comment`.
 
-Run the dependency-free checks from the repository root with:
-`node --test .github\extensions\review-interaction\*.test.mjs`.
+The canvas shows the graph with live progress on each reviewer, and every
+comment: open comments first, resolved comments last. **Run review** repeats
+the last request.
+
+Preset controls sit below the graph on the left, with **Run review** on the
+right. The **+** button in the graph's bottom-right corner adds a reviewer.
+
+## Reviewers
+
+A reviewer is a prompt file, a model, and a reasoning effort. Hover over a
+reviewer and click its pencil to edit it. The reviewer's prompt is the prompt
+file, the review request, and instructions for the review tools.
+
+Prompt file paths can be absolute, or relative to this extension's folder.
+The included review prompts are in `reviews\`. Pasted paths from Windows
+"Copy as path" work as is. Reviewers read their prompt file at the start of
+every pass, so edits to it apply to the next pass.
+
+Reviewers run in a workflow, because workflow agents are the only subagents
+that accept a reasoning effort. Subagents can't call canvas actions, so the
+review tools are extension tools.
+
+## Presets
+
+A preset is a saved graph. New sessions start from the **Default** preset,
+which has one parallel reviewer per `.md` file in this extension's `reviews\`
+folder. Saving over **Default** replaces it for every session.
+
+The preset list shows the loaded preset. A bold name with `*` means the graph
+has changes that aren't saved. **Save** writes them to the loaded preset, and
+**Save as...** writes them to a new one. Switching presets with unsaved
+changes asks whether to save them first.
+
+## Storage
+
+- This session's graph, loaded preset, last request, and comments:
+  `<session workspace>\files\review.json`.
+- Presets, shared by every session:
+  `$COPILOT_HOME\extensions\review-interaction\artifacts\presets.json`.
+
+## Tests
+
+From the repository root: `node --test .github\extensions\review-interaction\*.test.mjs`.

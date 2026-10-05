@@ -1,21 +1,11 @@
 import assert from "node:assert/strict";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { test } from "node:test";
-import { ReviewInteraction } from "./review.mjs";
+import { runGraph, validateGraph } from "./graph.mjs";
+import { Review } from "./review.mjs";
 import { startServer } from "./server.mjs";
-
-function fixture(overrides = {}) {
-    const calls = { logs: [], messages: [] };
-    return new ReviewInteraction({
-        calls,
-        startAgent: async () => ({ agentId: "agent-1" }),
-        list: async () => ({ tasks: [
-            { type: "agent", id: "agent-1", status: "completed", result: "Reviewer result" },
-        ] }),
-        log: async (message, options) => { calls.logs.push({ message, options }); },
-        send: async (options) => { calls.messages.push(options); return "message-1"; },
-        ...overrides,
-    }, { pollIntervalMs: 1 });
-}
 
 function deferred() {
     let resolve;
@@ -23,236 +13,218 @@ function deferred() {
     return { promise, resolve };
 }
 
-test("a click calls the direct task RPC and prevents duplicate launches", async () => {
-    let sent;
-    let launch;
-    const review = fixture({
-        startAgent: (options) => {
-            sent = options;
-            return new Promise((resolve) => { launch = resolve; });
+const node = (id) => ({ id, name: id, prompt: "", model: "", effort: "", x: 0, y: 0 });
+
+// A repository with one source file, an extension folder with three review prompts, and a fake agent runtime.
+async function fixture(t, { runAgent = async () => "Done.", models = [] } = {}) {
+    const root = await mkdtemp(join(tmpdir(), "review-"));
+    t.after(() => rm(root, { recursive: true, force: true }));
+    const extensionDir = join(root, "extension");
+    await mkdir(join(extensionDir, "reviews"), { recursive: true });
+    for (const name of ["design", "readability", "testing"]) {
+        await writeFile(join(extensionDir, "reviews", `${name}.md`), `# ${name} review\n`);
+    }
+    await writeFile(join(root, "app.js"), ["one", "two", "three", "four", "five", "six", "seven"].join("\n"));
+
+    const messages = [];
+    const prompts = [];
+    let review;
+    const options = {
+        root,
+        extensionDir,
+        sessionFile: join(root, "session", "review.json"),
+        presetsFile: join(root, "home", "presets.json"),
+        api: {
+            startWorkflow: async () => {
+                await review.runPass("run-1", async (prompt, agentOptions) => {
+                    prompts.push({ prompt, ...agentOptions });
+                    return runAgent(review, prompt, agentOptions);
+                });
+                return { status: "completed" };
+            },
+            cancelWorkflow: async () => {},
+            notify: async (message) => { messages.push(message); },
+            listModels: async () => models,
         },
+    };
+    review = await Review.load(options);
+    return { review, root, options, messages, prompts };
+}
+
+test("connected reviewers run in order and unconnected reviewers run at the same time", async () => {
+    const graph = { nodes: [node("a"), node("b"), node("c")], edges: [{ from: "a", to: "c" }] };
+    const started = [];
+    const finishA = deferred();
+    const run = runGraph(graph, async ({ id }) => {
+        started.push(id);
+        if (id === "a") await finishA.promise;
+        return true;
     });
-    const pending = review.start("demo-panel");
-    await assert.rejects(review.start("second-panel"), { code: "review_busy" });
-    assert.equal(sent.agentType, "code-review");
-    assert.match(sent.prompt, /Read only README.md/);
-    assert.match(sent.name, /^canvas-review-/);
-    assert.equal(Object.hasOwn(sent, "model"), false);
-    launch({ agentId: "agent-1" });
-    const started = await pending;
-    assert.equal(started.agentId, "agent-1");
-    assert.equal(started.instanceId, "demo-panel");
-    await review.completion;
-    assert.equal(review.snapshot().status, "done");
-    assert.equal(review.snapshot().summary, "Reviewer result");
-    assert.equal(review.snapshot().notificationStatus, "sent");
-    assert.equal(review.snapshot().busy, false);
+
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.deepEqual(started.sort(), ["a", "b"]);
+    finishA.resolve();
+    await run;
+    assert.deepEqual(started.sort(), ["a", "b", "c"]);
 });
 
-test("only a stopped reviewer sends a main-agent message, with persisted info start/stop logs", async () => {
-    let polls = 0;
-    const listed = deferred();
-    const release = deferred();
-    const review = fixture({
-        list: async () => {
-            polls++;
-            if (polls === 1) {
-                listed.resolve();
-                await release.promise;
+test("reviewers after a failed reviewer don't run", async () => {
+    const graph = { nodes: [node("a"), node("b"), node("c")], edges: [{ from: "a", to: "c" }] };
+    const started = [];
+    await runGraph(graph, async ({ id }) => {
+        started.push(id);
+        return id !== "a";
+    });
+    assert.deepEqual(started.sort(), ["a", "b"]);
+});
+
+test("graphs with loops are rejected", () => {
+    const loop = { nodes: [node("a"), node("b")], edges: [{ from: "a", to: "b" }, { from: "b", to: "a" }] };
+    assert.throws(() => validateGraph(loop), { code: "invalid_graph" });
+    assert.throws(() => validateGraph({ nodes: [node("a")], edges: [{ from: "a", to: "a" }] }), { code: "invalid_graph" });
+});
+
+test("the default graph has one parallel reviewer per review prompt", async (t) => {
+    const { review } = await fixture(t);
+    assert.deepEqual(review.graph.nodes.map((node) => node.prompt), ["reviews/design.md", "reviews/readability.md", "reviews/testing.md"]);
+    assert.deepEqual(review.graph.edges, []);
+});
+
+test("a review pass sends each reviewer its definition, the request, and its tool instructions", async (t) => {
+    const models = [{ id: "fast", name: "Fast", efforts: [] }, { id: "smart", name: "Smart", efforts: ["low", "high"] }];
+    const { review, prompts } = await fixture(t, { models });
+    const [design, readability] = review.graph.nodes;
+    await review.setGraph({
+        nodes: [{ ...design, model: "smart", effort: "high" }, { ...readability, model: "fast", effort: "high" }],
+        edges: [],
+    });
+
+    await review.start({ request: "Add a cache", scope: "All unstaged changes" });
+    await review.finished;
+
+    const designPrompt = prompts.find((call) => call.prompt.includes("# design review"));
+    assert.match(designPrompt.prompt, /Add a cache/);
+    assert.match(designPrompt.prompt, /All unstaged changes/);
+    assert.match(designPrompt.prompt, /reviewer "design"/);
+    assert.match(designPrompt.prompt, /review_add_comment/);
+    assert.equal(designPrompt.model, "smart");
+    assert.equal(designPrompt.reasoningEffort, "high");
+
+    const readabilityCall = prompts.find((call) => call.prompt.includes("# readability review"));
+    assert.equal(readabilityCall.reasoningEffort, undefined, "an effort the model doesn't support is dropped");
+});
+
+test("reviewer comments keep a snippet of the code and the implementer is told what's open", async (t) => {
+    const { review, messages } = await fixture(t, {
+        runAgent: async (review, prompt) => {
+            if (prompt.includes("# design review")) {
+                await review.addComment({ reviewer: "design", file: "app.js", line: 4, body: "Why four?" });
             }
-            return { tasks: [
-                { type: "agent", id: "other", status: "completed", result: "Unrelated" },
-                { type: "agent", id: "agent-1", status: polls === 1 ? "running" : "completed", result: "Direct result" },
-            ] };
+            return "Done.";
         },
     });
-    await review.start("demo-panel");
-    await listed.promise;
-    assert.equal(review.snapshot().status, "reviewing");
-    assert.equal(review.api.calls.messages.length, 0);
-    assert.equal(review.api.calls.logs.length, 1);
-    assert.match(review.api.calls.logs[0].message, /Review started/);
-    await assert.rejects(review.start("second-panel"), { code: "review_busy" });
-    release.resolve();
-    await review.completion;
-    const completed = review.snapshot();
-    assert.equal(completed.summary, "Direct result");
-    assert.equal(review.api.calls.messages.length, 1);
-    assert.match(review.api.calls.messages[0].prompt, /Review finished/);
-    assert.match(review.api.calls.messages[0].prompt, /Direct result/);
-    assert.equal(review.api.calls.messages[0].mode, "enqueue");
-    assert.equal(review.api.calls.logs.length, 2);
-    assert.match(review.api.calls.logs[1].message, /Review finished/);
-    for (const log of review.api.calls.logs) {
-        assert.deepEqual(log.options, { level: "info", ephemeral: false });
-    }
-    completed.warnings.push("Not shared");
-    assert.equal(review.snapshot().warnings.length, 0);
-    await review.start("second-panel");
-    await review.completion;
-    assert.equal(review.snapshot().status, "done");
+
+    await review.start({ request: "Count", scope: "app.js" });
+    await review.finished;
+
+    const [comment] = review.snapshot().comments;
+    assert.equal(comment.file, "app.js");
+    assert.deepEqual(comment.snippet, { start: 2, lines: ["two", "three", "four", "five", "six"] });
+    assert.equal(review.snapshot().run.nodes.design.status, "done");
+    assert.match(messages[0], /1 review comment\(s\) are open/);
+    assert.match(review.listComments(), /c1 \[open\] Design on app.js:4/);
 });
 
-test("an idle agent's latest response is collected directly", async () => {
-    const review = fixture({
-        list: async () => ({ tasks: [
-            { type: "agent", id: "agent-1", status: "idle", latestResponse: "Idle reviewer result" },
-        ] }),
+test("only the reviewer that wrote a comment can resolve it, and resolved comments sort last", async (t) => {
+    const { review } = await fixture(t);
+    await review.start({ request: "Count", scope: "app.js" });
+    await review.finished;
+    await review.addComment({ reviewer: "design", file: "app.js", line: 1, body: "First" });
+    await review.addComment({ reviewer: "testing", file: "app.js", line: 2, body: "Second" });
+
+    await assert.rejects(review.resolveComment({ reviewer: "testing", id: "c1" }), { code: "not_your_comment" });
+    await review.resolveComment({ reviewer: "design", id: "c1", note: "Fixed" });
+
+    assert.deepEqual(review.snapshot().comments.map((comment) => [comment.id, comment.status]), [["c2", "open"], ["c1", "resolved"]]);
+});
+
+test("the next pass gives each reviewer its open comments and the implementer's replies", async (t) => {
+    const { review, prompts } = await fixture(t);
+    await review.start({ request: "Count", scope: "app.js" });
+    await review.finished;
+    await review.addComment({ reviewer: "design", file: "app.js", line: 1, body: "Rename this" });
+    await review.reply({ id: "c1", body: "The name matches the spec." });
+
+    await review.start({ request: "Count", scope: "app.js" });
+    await review.finished;
+
+    const lastPass = prompts.slice(-3);
+    const promptFor = (name) => lastPass.find((call) => call.prompt.includes(`# ${name} review`)).prompt;
+    assert.match(promptFor("design"), /Your open comments from earlier passes/);
+    assert.match(promptFor("design"), /Rename this/);
+    assert.match(promptFor("design"), /Implementer: The name matches the spec\./);
+    assert.doesNotMatch(promptFor("testing"), /Your open comments/);
+});
+
+test("changes to the loaded preset show as modified until they are saved", async (t) => {
+    const { review } = await fixture(t);
+    assert.equal(review.snapshot().preset, "Default");
+    assert.equal(review.snapshot().modified, false);
+
+    await review.setGraph({ nodes: [node("solo")], edges: [] });
+    assert.equal(review.snapshot().modified, true);
+
+    await review.savePreset("Just one");
+    assert.equal(review.snapshot().preset, "Just one");
+    assert.equal(review.snapshot().modified, false);
+});
+
+test("presets are shared between sessions, and a saved Default replaces the included one", async (t) => {
+    const { review, options } = await fixture(t);
+    await review.setGraph({ nodes: [node("solo")], edges: [] });
+    await review.savePreset("Just one");
+    await review.setGraph({ nodes: [node("pair-1"), node("pair-2")], edges: [] });
+    await review.savePreset("Default");
+
+    const other = await Review.load({ ...options, sessionFile: join(options.root, "other", "review.json") });
+    assert.deepEqual(other.snapshot().presets, ["Default", "Just one"]);
+    assert.deepEqual(other.graph.nodes.map((node) => node.id), ["pair-1", "pair-2"]);
+
+    await other.loadPreset("Just one");
+    assert.deepEqual(other.graph.nodes.map((node) => node.id), ["solo"]);
+});
+
+test("prompt files can be absolute or relative to the extension's folder, and missing ones are reported", async (t) => {
+    const { review, prompts } = await fixture(t);
+    const shared = await mkdtemp(join(tmpdir(), "shared-reviews-"));
+    t.after(() => rm(shared, { recursive: true, force: true }));
+    await writeFile(join(shared, "security.md"), "# security review\n");
+
+    const [design] = review.graph.nodes;
+    await review.setGraph({
+        nodes: [{ ...design }, { ...node("security"), prompt: join(shared, "security.md") }, { ...node("gone"), prompt: "reviews/gone.md" }],
+        edges: [],
     });
-    await review.start("demo-panel");
-    await review.completion;
-    assert.equal(review.snapshot().status, "done");
-    assert.equal(review.snapshot().summary, "Idle reviewer result");
-    assert.equal(review.snapshot().taskStatus, "idle");
+    assert.deepEqual(review.snapshot().missingPrompts, ["gone"]);
+
+    await review.start({ request: "Count", scope: "app.js" });
+    await review.finished;
+    assert.ok(prompts.some((call) => call.prompt.includes("# design review")));
+    assert.ok(prompts.some((call) => call.prompt.includes("# security review")));
+    assert.equal(review.snapshot().run.nodes.gone.status, "failed");
 });
 
-test("direct launch failures are surfaced, with no prompt fallback", async () => {
-    for (const startAgent of [
-        async () => { throw new Error("RPC denied"); },
-        async () => ({}),
-    ]) {
-        const review = fixture({ startAgent });
-        await assert.rejects(review.start("demo-panel"));
-        await review.completion;
-        assert.equal(review.snapshot().status, "error");
-        assert.match(review.snapshot().error, /Direct review launch failed/);
-        assert.equal(review.snapshot().summary, undefined);
-        assert.equal(review.api.calls.messages.length, 1);
-        assert.match(review.api.calls.messages[0].prompt, /Review stopped with an error/);
-        assert.equal(review.api.calls.logs.length, 1);
-    }
-});
+test("the canvas only accepts changes from its own page", async (t) => {
+    const { review } = await fixture(t);
+    const canvas = await startServer(review);
+    t.after(() => canvas.close());
+    const graph = JSON.stringify({ nodes: [node("solo")], edges: [] });
 
-test("monitoring failures cannot claim review completion or notify the main agent", async () => {
-    for (const list of [
-        async () => { throw new Error("RPC unavailable"); },
-        async () => ({ tasks: [] }),
-        async () => ({ tasks: [{ type: "agent", id: "agent-1", status: "unknown" }] }),
-    ]) {
-        const review = fixture({ list });
-        await review.start("demo-panel");
-        await review.completion;
-        assert.equal(review.snapshot().status, "error");
-        assert.match(review.snapshot().error, /reviewer may still be running/);
-        assert.equal(review.snapshot().summary, undefined);
-        assert.equal(review.snapshot().notificationStatus, undefined);
-        assert.equal(review.api.calls.messages.length, 0);
-    }
-});
+    const foreign = await fetch(`${canvas.url}graph`, { method: "PUT", body: graph, headers: { Origin: "https://example.com" } });
+    assert.equal(foreign.status, 403);
+    assert.equal(review.graph.nodes.length, 3);
 
-test("stopped reviewers with failure, cancellation, or missing output notify the main agent once", async () => {
-    for (const task of [
-        { status: "failed", error: "Review denied" },
-        { status: "cancelled" },
-        { status: "completed" },
-    ]) {
-        const review = fixture({
-            list: async () => ({ tasks: [{ type: "agent", id: "agent-1", ...task }] }),
-        });
-        await review.start("demo-panel");
-        await review.completion;
-        assert.equal(review.snapshot().status, "error");
-        assert.equal(review.snapshot().notificationStatus, "sent");
-        assert.equal(review.api.calls.messages.length, 1);
-        assert.match(review.api.calls.messages[0].prompt, /Review stopped with an error/);
-    }
-});
-
-test("the review is complete while its handoff is pending, but cannot be restarted yet", async () => {
-    const sending = deferred();
-    const release = deferred();
-    const review = fixture({
-        send: async () => { sending.resolve(); return release.promise; },
-    });
-    await review.start("demo-panel");
-    await sending.promise;
-    assert.equal(review.snapshot().status, "done");
-    assert.equal(review.snapshot().notificationStatus, "pending");
-    assert.equal(review.snapshot().summary, "Reviewer result");
-    await assert.rejects(review.start("second-panel"), { code: "review_busy" });
-    release.resolve("message-1");
-    await review.completion;
-    assert.equal(review.snapshot().busy, false);
-    assert.equal(review.snapshot().notificationStatus, "sent");
-});
-
-test("log and handoff failures remain separate from a successful review result", async () => {
-    const missingLogs = fixture({ log: async () => { throw new Error("Logging unavailable"); } });
-    await missingLogs.start("demo-panel");
-    await missingLogs.completion;
-    assert.equal(missingLogs.snapshot().status, "done");
-    assert.equal(missingLogs.snapshot().warnings.length, 2);
-    assert.match(missingLogs.snapshot().warnings[0], /Logging unavailable/);
-    assert.equal(missingLogs.snapshot().notificationStatus, "sent");
-    for (const send of [
-        async () => { throw new Error("Message unavailable"); },
-        async () => "",
-    ]) {
-        const review = fixture({ send });
-        await review.start("demo-panel");
-        await review.completion;
-        assert.equal(review.snapshot().status, "done");
-        assert.equal(review.snapshot().summary, "Reviewer result");
-        assert.equal(review.snapshot().notificationStatus, "failed");
-        assert.match(review.snapshot().deliveryError, /Could not notify/);
-        assert.equal(review.snapshot().busy, false);
-    }
-});
-
-test("loopback button endpoint, assets, shared state and origin checks", async (t) => {
-    let launches = 0;
-    let release;
-    const listed = deferred();
-    const review = fixture({
-        startAgent: async () => { launches++; return { agentId: "agent-1" }; },
-        list: () => {
-            listed.resolve();
-            return new Promise((resolve) => { release = resolve; });
-        },
-    });
-    const first = await startServer(review, "first-panel");
-    const second = await startServer(review, "second-panel");
-    t.after(async () => { await first.close(); await second.close(); });
-    const origin = new URL(first.url).origin;
-    const page = await fetch(first.url);
-    assert.equal(page.status, 200);
-    assert.match(await page.text(), /id="start"/);
-    for (const asset of ["app.js", "style.css"]) {
-        assert.equal((await fetch(`${first.url}${asset}`)).status, 200);
-    }
-    assert.equal((await fetch(`${origin}/state`)).status, 404);
-    assert.equal((await fetch(`${first.url}interaction`, { method: "POST" })).status, 404);
-    assert.equal((await fetch(`${first.url}review`, { method: "POST" })).status, 403);
-    assert.equal((await fetch(`${first.url}review`, {
-        method: "POST", headers: { Origin: "https://example.com" },
-    })).status, 403);
-    const click = await fetch(`${first.url}review`, { method: "POST", headers: { Origin: origin } });
-    assert.equal(click.status, 202);
-    assert.equal((await click.json()).instanceId, "first-panel");
-    assert.equal(launches, 1);
-    await listed.promise;
-    assert.equal((await fetch(`${first.url}review`, {
-        method: "POST", headers: { Origin: origin },
-    })).status, 409);
-    const shared = await (await fetch(`${second.url}state`)).json();
-    assert.equal(shared.requestId, review.snapshot().requestId);
-    release({ tasks: [{ type: "agent", id: "agent-1", status: "completed", result: "Direct result" }] });
-    await review.completion;
-    const result = await (await fetch(`${first.url}state`)).json();
-    assert.equal(result.summary, "Direct result");
-});
-
-test("HTTP launch failures return errors, not successful reviews", async (t) => {
-    const review = fixture({
-        startAgent: async () => { throw new Error("Direct execution blocked"); },
-    });
-    const panel = await startServer(review, "demo-panel");
-    t.after(() => panel.close());
-    const response = await fetch(`${panel.url}review`, {
-        method: "POST", headers: { Origin: new URL(panel.url).origin },
-    });
-    assert.equal(response.status, 500);
-    await review.completion;
-    assert.equal((await response.json()).error, "Direct execution blocked");
-    assert.equal(review.snapshot().status, "error");
+    const own = await fetch(`${canvas.url}graph`, { method: "PUT", body: graph, headers: { Origin: new URL(canvas.url).origin } });
+    assert.equal(own.status, 200);
+    assert.deepEqual(review.graph.nodes.map((node) => node.id), ["solo"]);
 });
