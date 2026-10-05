@@ -3,6 +3,12 @@
 `.github\extensions\review-interaction` runs a graph of review agents and
 collects their feedback on a canvas.
 
+## Install
+
+Run `.\install.ps1` from the repository root to install the review canvas
+for your user. Keep this checkout at the same path, and reload extensions
+or start a new Copilot session after updates.
+
 ## Flow
 
 1. The implementer calls `review_start` with the user's request and the code
