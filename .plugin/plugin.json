@@ -1,0 +1,15 @@
+{
+  "name": "agent-skills",
+  "description": "Agent skills, custom agents, and an OpenAI-only review canvas for GitHub Copilot.",
+  "version": "0.1.0",
+  "author": {
+    "name": "ellahathaway",
+    "url": "https://github.com/ellahathaway"
+  },
+  "homepage": "https://github.com/ellahathaway/agent-skills",
+  "repository": "https://github.com/ellahathaway/agent-skills",
+  "license": "MIT",
+  "skills": "./skills/",
+  "agents": "./agents/",
+  "extensions": "./extensions/"
+}

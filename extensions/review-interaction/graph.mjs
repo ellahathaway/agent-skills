@@ -1,3 +1,10 @@
+export const DEFAULT_MODEL = "gpt-6.1-sol";
+
+// The model catalog has no provider field, so use canonical OpenAI model IDs.
+export function isOpenAIModel(model) {
+    return /^(?:gpt-\d|o\d+(?:-|$)|codex(?:-|$))/.test(model);
+}
+
 function invalid(message) {
     return Object.assign(new Error(message), { code: "invalid_graph" });
 }
@@ -15,7 +22,7 @@ export function validateGraph(graph) {
         id: text(node.id),
         name: text(node.name) || text(node.id),
         prompt: text(node.prompt),
-        model: text(node.model),
+        model: text(node.model) || DEFAULT_MODEL,
         effort: text(node.effort),
         x: position(node.x),
         y: position(node.y),

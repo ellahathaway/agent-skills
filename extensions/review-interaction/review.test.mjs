@@ -16,7 +16,11 @@ function deferred() {
 const node = (id) => ({ id, name: id, prompt: "", model: "", effort: "", x: 0, y: 0 });
 
 // A repository with one source file, an extension folder with three review prompts, and a fake agent runtime.
-async function fixture(t, { runAgent = async () => "Done.", models = [] } = {}) {
+async function fixture(t, {
+    runAgent = async () => "Done.",
+    models = [{ id: "gpt-6.1-sol", name: "GPT-6.1 Sol", efforts: [] }],
+    saved,
+} = {}) {
     const root = await mkdtemp(join(tmpdir(), "review-"));
     t.after(() => rm(root, { recursive: true, force: true }));
     const extensionDir = join(root, "extension");
@@ -47,6 +51,10 @@ async function fixture(t, { runAgent = async () => "Done.", models = [] } = {}) 
             listModels: async () => models,
         },
     };
+    if (saved) {
+        await mkdir(join(root, "session"), { recursive: true });
+        await writeFile(options.sessionFile, JSON.stringify(saved));
+    }
     review = await Review.load(options);
     return { review, root, options, messages, prompts };
 }
@@ -87,15 +95,77 @@ test("graphs with loops are rejected", () => {
 test("the default graph has one parallel reviewer per review prompt", async (t) => {
     const { review } = await fixture(t);
     assert.deepEqual(review.graph.nodes.map((node) => node.prompt), ["reviews/design.md", "reviews/readability.md", "reviews/testing.md"]);
+    assert.deepEqual(review.graph.nodes.map((node) => node.model), ["gpt-6.1-sol", "gpt-6.1-sol", "gpt-6.1-sol"]);
     assert.deepEqual(review.graph.edges, []);
 });
 
+test("model choices include only available OpenAI model families", async (t) => {
+    const ids = ["gpt-6.1-sol", "gpt-5-mini", "o3", "o4-mini", "codex-mini", "claude-sonnet-5.5", "opus-5.5", "gemini-3.8-flash", "grok-4.7", "mai-code-1.1-flash", "gpt-j"];
+    const { review } = await fixture(t, { models: ids.map((id) => ({ id, name: id, efforts: [] })) });
+    assert.deepEqual(review.snapshot().models.map((model) => model.id), ["gpt-6.1-sol", "gpt-5-mini", "o3", "o4-mini", "codex-mini"]);
+});
+
+test("older saved graphs with blank models explicitly run on gpt-6.1-sol", async (t) => {
+    const { review, prompts, options } = await fixture(t, {
+        saved: { graph: { nodes: [{ ...node("design"), prompt: "reviews/design.md" }], edges: [] } },
+    });
+    await review.start({ request: "Count", scope: "app.js" });
+    await review.finished;
+    assert.equal(prompts[0].model, "gpt-6.1-sol");
+
+    const restored = await Review.load(options);
+    assert.equal(restored.graph.nodes[0].model, "gpt-6.1-sol");
+});
+
+test("saved non-OpenAI selections prevent every reviewer from launching", async (t) => {
+    for (const model of ["claude-sonnet-5.5", "opus-5.5", "gemini-3.8-flash", "grok-4.7", "mai-code-1.1-flash", "gpt-j"]) {
+        await t.test(model, async (t) => {
+            const { review, prompts } = await fixture(t, {
+                models: [
+                    { id: "gpt-6.1-sol", name: "GPT-6.1 Sol", efforts: [] },
+                    { id: model, name: model, efforts: [] },
+                ],
+                saved: {
+                    graph: {
+                        nodes: [
+                            { ...node("design"), prompt: "reviews/design.md" },
+                            { ...node("testing"), prompt: "reviews/testing.md", model },
+                        ],
+                        edges: [],
+                    },
+                },
+            });
+            await assert.rejects(review.start({ request: "Count", scope: "app.js" }), {
+                code: "invalid_model",
+                message: /Only OpenAI models are allowed/,
+            });
+            assert.deepEqual(prompts, []);
+            assert.equal(review.snapshot().run.status, "idle");
+        });
+    }
+});
+
+test("an unavailable requested model does not fall back to any other model", async (t) => {
+    const { review, prompts } = await fixture(t, {
+        models: [
+            { id: "gpt-5-mini", name: "GPT-5 Mini", efforts: [] },
+            { id: "claude-sonnet-5.5", name: "Claude Sonnet 5.5", efforts: [] },
+        ],
+    });
+    await assert.rejects(review.start({ request: "Count", scope: "app.js" }), {
+        code: "model_unavailable",
+        message: /No fallback model will be used/,
+    });
+    assert.deepEqual(prompts, []);
+    assert.equal(review.snapshot().run.status, "idle");
+});
+
 test("a review pass sends each reviewer its definition, the request, and its tool instructions", async (t) => {
-    const models = [{ id: "fast", name: "Fast", efforts: [] }, { id: "smart", name: "Smart", efforts: ["low", "high"] }];
+    const models = [{ id: "gpt-5-mini", name: "GPT-5 Mini", efforts: [] }, { id: "gpt-6.1-sol", name: "GPT-6.1 Sol", efforts: ["low", "high"] }];
     const { review, prompts } = await fixture(t, { models });
     const [design, readability] = review.graph.nodes;
     await review.setGraph({
-        nodes: [{ ...design, model: "smart", effort: "high" }, { ...readability, model: "fast", effort: "high" }],
+        nodes: [{ ...design, model: "gpt-6.1-sol", effort: "high" }, { ...readability, model: "gpt-5-mini", effort: "high" }],
         edges: [],
     });
 
@@ -107,10 +177,14 @@ test("a review pass sends each reviewer its definition, the request, and its too
     assert.match(designPrompt.prompt, /All unstaged changes/);
     assert.match(designPrompt.prompt, /reviewer "design"/);
     assert.match(designPrompt.prompt, /review_add_comment/);
-    assert.equal(designPrompt.model, "smart");
+    assert.match(designPrompt.prompt, /Use gpt-6\.1-sol for this review and any delegated work/);
+    assert.match(designPrompt.prompt, /Use only OpenAI models/);
+    assert.match(designPrompt.prompt, /Do not use Anthropic models/);
+    assert.equal(designPrompt.model, "gpt-6.1-sol");
     assert.equal(designPrompt.reasoningEffort, "high");
 
     const readabilityCall = prompts.find((call) => call.prompt.includes("# readability review"));
+    assert.equal(readabilityCall.model, "gpt-5-mini");
     assert.equal(readabilityCall.reasoningEffort, undefined, "an effort the model doesn't support is dropped");
 });
 

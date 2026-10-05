@@ -222,7 +222,7 @@ function indicator(status) {
 function nodeElement(node) {
     const run = state.run.nodes[node.id];
     const open = state.comments.filter((comment) => comment.reviewer === node.id && comment.status === "open").length;
-    const model = modelById(node.model)?.name ?? (node.model || "Default model");
+    const model = modelById(node.model)?.name ?? node.model;
     const progress = [run ? STATUS_TEXT[run.status] : "", open ? `${open} open` : ""].filter(Boolean).join(" · ");
     const warning = !run && state.missingPrompts.includes(node.id) ? "Prompt file not found" : "";
     const classes = ["node", run?.status, node.id === selectedId ? "selected" : ""].filter(Boolean).join(" ");
@@ -397,7 +397,7 @@ ui.add.addEventListener("click", () => {
 
     const id = `reviewer-${number}`;
     const bottom = Math.max(0, ...nodes.map((node) => at(node).y + NODE_HEIGHT));
-    const reviewer = { id, name: `Reviewer ${number}`, prompt: state.prompts[0] ?? "", model: "", effort: "", x: 2 * GRID, y: bottom + 2 * GRID };
+    const reviewer = { id, name: `Reviewer ${number}`, prompt: state.prompts[0] ?? "", model: state.defaultModel, effort: "", x: 2 * GRID, y: bottom + 2 * GRID };
     selectedId = id;
     changeGraph((graph) => graph.nodes.push(reviewer));
     ui.graph.querySelector(`.node[data-id="${CSS.escape(id)}"]`)?.scrollIntoView({ block: "nearest" });
@@ -442,7 +442,12 @@ function renderInspector() {
     ui.promptHint.textContent = `Use an absolute path, or a path relative to the extension's folder (${state.extensionDir}).`;
 
     const models = state.models.map((model) => [model.id, model.name]);
-    setOptions(ui.nodeModel, [["", "Default model"], ...models], node.model);
+    setOptions(ui.nodeModel, models, node.model);
+    const modelOption = [...ui.nodeModel.options].find((option) => option.value === node.model);
+    if (!modelById(node.model) && modelOption) {
+        modelOption.disabled = true;
+        modelOption.textContent = `${node.model} (unavailable)`;
+    }
 
     const efforts = modelById(node.model)?.efforts ?? [];
     setOptions(ui.nodeEffort, [["", "Default effort"], ...efforts.map((effort) => [effort, effort])], node.effort);

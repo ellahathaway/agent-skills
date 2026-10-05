@@ -1,13 +1,13 @@
 # Review canvas
 
-`.github\extensions\review-interaction` runs a graph of review agents and
+`extensions\review-interaction` runs a graph of review agents and
 collects their feedback on a canvas.
 
 ## Install
 
-Run `.\install.ps1` from the repository root to install the review canvas
-for your user. Keep this checkout at the same path, and reload extensions
-or start a new Copilot session after updates.
+Install the **agent-skills** plugin using the repository root's README.
+The plugin includes this canvas, its review prompts, the skills, and the
+agent profiles. Reload extensions or start a new Copilot session after updates.
 
 ## Flow
 
@@ -38,6 +38,16 @@ A reviewer is a prompt file, a model, and a reasoning effort. Hover over a
 reviewer and click its pencil to edit it. The reviewer's prompt is the prompt
 file, the review request, and instructions for the review tools.
 
+New reviewers use `gpt-6.1-sol`. The model picker offers only OpenAI GPT,
+o-series, and Codex models available to Copilot. Each reviewer is explicitly
+instructed not to use Anthropic or other non-OpenAI models, including for
+delegated work.
+
+A pass does not launch any agents if a selected model is non-OpenAI or
+unavailable. No fallback model is used. Blank model settings in older saved
+graphs now mean `gpt-6.1-sol`, not the runtime default. Change any non-OpenAI
+models in existing graphs or presets before running them.
+
 Prompt file paths can be absolute, or relative to this extension's folder.
 The included review prompts are in `reviews\`. Pasted paths from Windows
 "Copy as path" work as is. Reviewers read their prompt file at the start of
@@ -67,4 +77,4 @@ changes asks whether to save them first.
 
 ## Tests
 
-From the repository root: `node --test .github\extensions\review-interaction\*.test.mjs`.
+From the repository root: `node --test extensions\review-interaction\review.test.mjs`.

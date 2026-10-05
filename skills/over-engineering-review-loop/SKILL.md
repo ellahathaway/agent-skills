@@ -1,17 +1,20 @@
 ---
 name: over-engineering-review-loop
-description: Only use when explicitly asked.
+description: Review code for unnecessary complexity through an advisor feedback loop. Use when the user explicitly asks for an over-engineering review loop.
 ---
 
 Variables:
 - `MAX_ITERATIONS=3`
-- `MODEL=opus-5.5`
+- `MODEL=gpt-6.1-sol`
+
+Use only OpenAI models. Do not use Anthropic models, including Claude, or other non-OpenAI models.
+If `$MODEL` is unavailable, report the error and stop; do not switch models.
 
 We will now go through a process designed to simplify your implementation.
 
 ### Workflow
 
-Invoke an "overengineering-advisor" subagent using `$MODEL`.
+Invoke an "agent-skills:overengineering-advisor" subagent using `$MODEL`.
 Provide it with the user's request and tell it what code to review.
 Include enough context to allow the advisor to understand the scope of the code and request, but let your code speak for itself.
 For the code to review, select exactly one of:

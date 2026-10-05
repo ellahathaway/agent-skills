@@ -1,7 +1,7 @@
 import { statSync } from "node:fs";
 import { mkdir, readdir, readFile, writeFile } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
-import { runGraph, validateGraph } from "./graph.mjs";
+import { DEFAULT_MODEL, isOpenAIModel, runGraph, validateGraph } from "./graph.mjs";
 
 const SNIPPET_CONTEXT_LINES = 2;
 const SNIPPET_MAX_LINES = 20;
@@ -48,7 +48,7 @@ function defaultGraph(prompts) {
     const nodes = prompts.map((prompt, index) => {
         const id = basename(prompt, ".md");
         const name = id[0].toUpperCase() + id.slice(1);
-        return { id, name, prompt, model: "", effort: "", x: 32, y: 32 + index * 96 };
+        return { id, name, prompt, model: DEFAULT_MODEL, effort: "", x: 32, y: 32 + index * 96 };
     });
     return { nodes, edges: [] };
 }
@@ -106,7 +106,7 @@ export class Review {
         review.comments = saved.comments ?? [];
         review.pass = saved.pass ?? 0;
 
-        review.models = await api.listModels();
+        review.models = (await api.listModels()).filter((model) => isOpenAIModel(model.id));
         return review;
     }
 
@@ -120,6 +120,7 @@ export class Review {
             run: this.run,
             comments: this.sortedComments(),
             presets: this.presets.map((preset) => preset.name),
+            defaultModel: DEFAULT_MODEL,
             models: this.models,
             prompts: this.prompts,
             missingPrompts: this.graph.nodes.filter((node) => !isFile(this.promptPath(node))).map((node) => node.id),
@@ -211,6 +212,15 @@ export class Review {
         }
         if (!this.graph.nodes.length) throw failure("no_reviewers", "Add a reviewer on the review canvas first.");
 
+        for (const node of this.graph.nodes) {
+            if (!isOpenAIModel(node.model)) {
+                throw failure("invalid_model", `"${node.name}" uses "${node.model}". Only OpenAI models are allowed. Select ${DEFAULT_MODEL} or another available OpenAI model.`);
+            }
+            if (!this.models.some((model) => model.id === node.model)) {
+                throw failure("model_unavailable", `The OpenAI model "${node.model}" selected for "${node.name}" is unavailable. Select an available OpenAI model on the review canvas. No fallback model will be used.`);
+            }
+        }
+
         this.request = { request: request.trim(), scope: scope.trim() };
         this.pass++;
         this.passGraph = structuredClone(this.graph);
@@ -247,7 +257,7 @@ export class Review {
                 const prompt = await this.reviewerPrompt(node);
                 const result = await runAgent(prompt, {
                     label: `${node.id} pass ${this.run.pass}`,
-                    model: node.model || undefined,
+                    model: node.model,
                     reasoningEffort: this.supportedEffort(node),
                 });
                 if (result === null) throw new Error("The reviewer stopped without finishing.");
@@ -331,6 +341,12 @@ export class Review {
             "",
             `The user's request: ${this.request.request}`,
             `The code to review: ${this.request.scope}`,
+            "",
+            "## Model policy",
+            "",
+            `Use ${node.model} for this review and any delegated work.`,
+            "Use only OpenAI models. Do not use Anthropic models, including Claude, or other non-OpenAI models.",
+            "If the selected model is unavailable, report the error and stop. Do not switch models.",
             "",
             "## Recording feedback",
             "",
